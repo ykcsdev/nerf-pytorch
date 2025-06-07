@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
+from datetime import datetime, timedelta
 
 import matplotlib.pyplot as plt
 
@@ -17,6 +18,28 @@ from run_nerf_helpers import *
 from load_llff import load_llff_data
 from load_deepvoxels import load_dv_data
 from load_blender import load_blender_data
+
+import logging
+import lpips
+
+# Set up the logger
+logger = logging.getLogger('PrintLogger')
+logger.setLevel(logging.INFO)
+time_str = datetime.now().strftime('%H%M%S')
+
+# Custom class to redirect stdout
+class LoggerWriter:
+    def __init__(self, logger):
+        self.logger = logger
+        self._buffer = ''
+
+    def write(self, message):
+        message = message.rstrip()
+        if message:
+            self.logger.info(message)
+
+    def flush(self):
+        pass  # Needed for compatibility
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -210,7 +233,9 @@ def create_nerf(args):
 
     start = 0
     basedir = args.basedir
-    expname = args.expname
+    expname = args.expname        
+    subset_fractioner=args.subset_fraction
+    expname = f"{expname}_{time_str}_{subset_fractioner}"
 
     ##########################
 
@@ -458,6 +483,10 @@ def config_parser():
                         help='do not reload weights from saved ckpt')
     parser.add_argument("--ft_path", type=str, default=None, 
                         help='specific weights npy file to reload for coarse network')
+    parser.add_argument("--subset_fraction", type=float, default=1.0, 
+                        help='number of subset per dataset')
+    parser.add_argument("--subset_seed", type=int, default=42,
+                        help='number of subset_seed per ray')
 
     # rendering options
     parser.add_argument("--N_samples", type=int, default=64, 
@@ -521,13 +550,13 @@ def config_parser():
     # logging/saving options
     parser.add_argument("--i_print",   type=int, default=100, 
                         help='frequency of console printout and metric loggin')
-    parser.add_argument("--i_img",     type=int, default=500, 
+    parser.add_argument("--i_img",     type=int, default=5000, 
                         help='frequency of tensorboard image logging')
-    parser.add_argument("--i_weights", type=int, default=10000, 
+    parser.add_argument("--i_weights", type=int, default=5000, 
                         help='frequency of weight ckpt saving')
-    parser.add_argument("--i_testset", type=int, default=50000, 
+    parser.add_argument("--i_testset", type=int, default=5000, 
                         help='frequency of testset saving')
-    parser.add_argument("--i_video",   type=int, default=50000, 
+    parser.add_argument("--i_video",   type=int, default=5000, 
                         help='frequency of render_poses video saving')
 
     return parser
@@ -541,12 +570,14 @@ def train():
     # Multi-GPU
     args.n_gpus = torch.cuda.device_count()
     print(f"Using {args.n_gpus} GPU(s).")
-
+    subset_fractioner=args.subset_fraction
     # Load data
     if args.dataset_type == 'llff':
-        images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
-                                                                  recenter=True, bd_factor=.75,
-                                                                  spherify=args.spherify)
+        # images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
+        #                                                           recenter=True, bd_factor=.75,
+        #                                                           spherify=args.spherify)
+        images, poses, bds, render_poses, i_test = load_llff_data(args.datadir, factor=args.factor, recenter=True, bd_factor=.75,
+                                         spherify=args.spherify,subset_fraction=subset_fractioner, seed=args.subset_seed)
         hwf = poses[0,:3,-1]
         poses = poses[:,:3,:4]
         print('Loaded llff', images.shape, render_poses.shape, hwf, args.datadir)
@@ -612,7 +643,24 @@ def train():
     # Create log dir and copy the config file
     basedir = args.basedir
     expname = args.expname
+    #Added by @ykcse1
+    expname = f"{expname}_{time_str}_{subset_fractioner}"
     os.makedirs(os.path.join(basedir, expname), exist_ok=True)
+    
+    #Added by @ykcse1
+    loss_curve_dir = os.path.join(basedir, expname, 'loss_curves')
+    os.makedirs(loss_curve_dir, exist_ok=True)  # Ensure directory exists
+    log_file = os.path.join(basedir, expname, 'logs_file.txt')
+    
+    handler = logging.FileHandler(log_file)
+    formatter = logging.Formatter('%(asctime)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+
+    #Added by @ykcse1
+    sys.stdout = LoggerWriter(logger)
+    sys.stderr = LoggerWriter(logger)  # Optional: redirect stderr as well
+
     f = os.path.join(basedir, expname, 'args.txt')
     with open(f, 'w') as file:
         for arg in sorted(vars(args)):
@@ -655,6 +703,23 @@ def train():
             rgbs, _ = render_path(render_poses, hwf, args.chunk, render_kwargs_test, gt_imgs=images, savedir=testsavedir, render_factor=args.render_factor)
             print('Done rendering', testsavedir)
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
+            #Added by @ykcse1 for LPIPS evaluation
+            if images is not None:
+                lpips_fn = lpips.LPIPS(net='alex').to(device)
+                lpips_scores = []
+
+                for pred_img, gt_img in zip(rgbs, images):
+                    pred = torch.from_numpy(pred_img).permute(2, 0, 1).unsqueeze(0).to(device)
+                    gt = torch.from_numpy(gt_img).permute(2, 0, 1).unsqueeze(0).to(device)
+
+                    pred = pred * 2. - 1.
+                    gt = gt * 2. - 1.
+
+                    score = lpips_fn(pred, gt).item()
+                    lpips_scores.append(score)
+
+                avg_lpips = sum(lpips_scores) / len(lpips_scores)
+                print(f"Average LPIPS over test set: {avg_lpips:.4f}")
 
             return
 
@@ -682,9 +747,9 @@ def train():
     poses = torch.Tensor(poses).to(device)
     if use_batching:
         rays_rgb = torch.Tensor(rays_rgb).to(device)
-
-
-    N_iters = 200000 + 1
+ 	#Added by @ykcse1 to change the training iterations
+    N_iters = 20000 + 1
+    # N_iters = 200000 + 1
     print('Begin')
     print('TRAIN views are', i_train)
     print('TEST views are', i_test)
@@ -694,6 +759,7 @@ def train():
     # writer = SummaryWriter(os.path.join(basedir, 'summaries', expname))
     
     start = start + 1
+    loss_list = []
     for i in trange(start, N_iters):
         time0 = time.time()
 
@@ -812,6 +878,13 @@ def train():
     
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
+            loss_list.append(loss.item())
+            plt.plot(loss_list)
+            plt.title("Training Loss Curve")
+            plt.xlabel("Iteration")
+            plt.ylabel("Loss")
+            loss_curve_file = os.path.join(loss_curve_dir, f'{expname}_{i}th_iter_loss_curve.png')
+            plt.savefig(loss_curve_file)
         """
             print(expname, i, psnr.numpy(), loss.numpy(), global_step.numpy())
             print('iter time {:.05f}'.format(dt))
@@ -856,8 +929,23 @@ def train():
 
         global_step += 1
 
+    plt.plot(loss_list)
+    plt.title("Training Loss Curve")
+    plt.xlabel("Iteration")
+    plt.ylabel("Loss") 
+    loss_curve_file = os.path.join(loss_curve_dir, f'{expname}_final_loss_curve.png')
+    plt.savefig(loss_curve_file)
+
 
 if __name__=='__main__':
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
-
+    start_time = time.time()
     train()
+    end_time = time.time()
+    end_time_formatted = datetime.fromtimestamp(end_time).strftime('%H-%M-%S.%f')[:-3]
+    print(f"Training ended at: {end_time_formatted}")
+
+    # Calculate and format duration
+    duration_seconds = end_time - start_time
+    duration = timedelta(seconds=duration_seconds)
+    print(f"Total training time (HH:MM:SS.ms): {str(duration)}")
